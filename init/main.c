@@ -108,6 +108,14 @@
 #include <asm/setup.h>
 #include <asm/sections.h>
 #include <asm/cacheflush.h>
+#include <asm/csr.h>
+
+#ifdef CONFIG_PT_AREA
+#include <linux/pt_area.h>
+#include <asm/tlbflush.h>
+#include <asm/page.h>
+#endif
+
 
 #define CREATE_TRACE_POINTS
 #include <trace/events/initcall.h>
@@ -862,6 +870,60 @@ static void __init mm_init(void)
 	kmsan_init_runtime();
 }
 
+#ifdef CONFIG_PT_AREA
+int enclave_module_installed;
+EXPORT_SYMBOL(enclave_module_installed);
+extern pgd_t *new_swapper_pg_dir;
+
+static void deep_copy_pt(pte_t *src, pte_t *dst, unsigned int level)
+{
+	unsigned int i;
+
+	for (i = 0; i < PTRS_PER_PGD; i++) {
+		unsigned long entry = src[i].pte;
+
+		if (!(entry & _PAGE_PRESENT))
+			continue;
+
+		if (entry & (_PAGE_READ | _PAGE_EXEC)) {
+			dst[i] = __pte(entry);
+		} else {
+			pte_t *child = level == 0 ?
+				(pte_t *)alloc_pt_pmd_page() :
+				(pte_t *)alloc_pt_pte_page();
+			pte_t *old_child = (pte_t *)pfn_to_virt(
+				(entry & _PAGE_PFN_MASK) >> _PAGE_PFN_SHIFT);
+
+			if (!child)
+				panic("Penglai: page-table area exhausted during boot");
+			deep_copy_pt(old_child, child, level + 1);
+			src[i] = pfn_pte(PFN_DOWN(__pa(child)),
+					 __pgprot(entry & 0x3ff));
+			dst[i] = src[i];
+		}
+	}
+}
+
+static void __init transfer_init_pt(void)
+{
+	pte_t *new_root = (pte_t *)alloc_pt_pgd_page();
+	unsigned int i;
+
+	if (!new_root)
+		panic("Penglai: cannot allocate protected root page table");
+	new_swapper_pg_dir = (pgd_t *)__pa(new_root);
+	deep_copy_pt((pte_t *)swapper_pg_dir, new_root, 0);
+	mb();
+	init_mm.pgd = (pgd_t *)new_root;
+	csr_write(CSR_SATP, virt_to_pfn(new_root) | satp_mode);
+	local_flush_tlb_all();
+
+	for (i = 0; i < PTRS_PER_PGD; i++)
+		swapper_pg_dir[i] = __pgd(0);
+	enclave_module_installed = 0;
+}
+#endif
+
 #ifdef CONFIG_RANDOMIZE_KSTACK_OFFSET
 DEFINE_STATIC_KEY_MAYBE_RO(CONFIG_RANDOMIZE_KSTACK_OFFSET_DEFAULT,
 			   randomize_kstack_offset);
@@ -996,6 +1058,10 @@ asmlinkage __visible void __init __no_sanitize_address start_kernel(void)
 	trap_init();
 	mm_init();
 
+	#ifdef CONFIG_PT_AREA
+	init_pt_area();
+	transfer_init_pt();
+	#endif
 	ftrace_init();
 
 	/* trace_printk can be enabled here */

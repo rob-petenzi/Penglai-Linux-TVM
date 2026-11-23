@@ -157,6 +157,29 @@ config RISCV_SBI
 	depends on !RISCV_M_MODE
 	default y
 
+# set if we enable PT_AREA for penglai enclave
+config PT_AREA
+  	bool 
+	help
+	  Reserve page-table pages in a protected area managed by the Penglai
+	  monitor. The current TVM monitor supports Sv39's PGD/PMD/PTE levels;
+	  the kernel selects Sv39 when this option is enabled.
+	default y
+
+config PT_AREA_BATCH
+  	bool
+	depends on PT_AREA
+	default y
+
+config ARCH_FORCE_MAX_ORDER
+	int
+	depends on PT_AREA
+	default 16
+
+config EARLY_PRINTK
+  	bool 
+	default y
+
 config MMU
 	bool "MMU-based Paged Memory Management Support"
 	default y

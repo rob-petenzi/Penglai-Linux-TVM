@@ -164,7 +164,12 @@ secondary_start_sbi:
 
 #ifdef CONFIG_MMU
 	/* Enable virtual memory and relocate to virtual address */
+#ifdef CONFIG_PT_AREA
+	la a0, new_swapper_pg_dir
+	REG_L a0, 0(a0)
+#else
 	la a0, swapper_pg_dir
+#endif
 	XIP_FIXUP_OFFSET a0
 	call relocate_enable_mmu
 #endif

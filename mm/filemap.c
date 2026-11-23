@@ -3386,7 +3386,12 @@ again:
 		if (vmf->address == addr)
 			ret = VM_FAULT_NOPAGE;
 
-		do_set_pte(vmf, page, addr);
+		#ifdef CONFIG_PT_AREA_BATCH
+		if (enclave_module_installed)
+			do_set_pte_noset(vmf, page, addr);
+		else
+		#endif
+			do_set_pte(vmf, page, addr);
 		/* no need to invalidate: a not-present page won't be cached */
 		update_mmu_cache(vma, addr, vmf->pte);
 		if (folio_more_pages(folio, xas.xa_index, end_pgoff)) {
@@ -3404,6 +3409,10 @@ unlock:
 		folio_unlock(folio);
 		folio_put(folio);
 	} while ((folio = next_map_page(mapping, &xas, end_pgoff)) != NULL);
+	#ifdef CONFIG_PT_AREA_BATCH
+	if (enclave_module_installed)
+		flush_pt_area_set_buffer2();
+	#endif
 	pte_unmap_unlock(vmf->pte, vmf->ptl);
 out:
 	rcu_read_unlock();

@@ -28,6 +28,7 @@ enum sbi_ext_id {
 	SBI_EXT_IPI = 0x735049,
 	SBI_EXT_RFENCE = 0x52464E43,
 	SBI_EXT_HSM = 0x48534D,
+	SBI_EXT_PENGLAI = 0x100100,
 	SBI_EXT_SRST = 0x53525354,
 	SBI_EXT_PMU = 0x504D55,
 
@@ -260,6 +261,17 @@ struct sbiret sbi_ecall(int ext, int fid, unsigned long arg0,
 			unsigned long arg1, unsigned long arg2,
 			unsigned long arg3, unsigned long arg4,
 			unsigned long arg5);
+
+long SBI_PENGLAI_ECALL_0(int fid);
+long SBI_PENGLAI_ECALL_1(int fid, unsigned long arg0);
+long SBI_PENGLAI_ECALL_2(int fid, unsigned long arg0, unsigned long arg1);
+long SBI_PENGLAI_ECALL_3(int fid, unsigned long arg0, unsigned long arg1,
+			 unsigned long arg2);
+long SBI_PENGLAI_ECALL_4(int fid, unsigned long arg0, unsigned long arg1,
+			 unsigned long arg2, unsigned long arg3);
+long SBI_PENGLAI_ECALL_5(int fid, unsigned long arg0, unsigned long arg1,
+			 unsigned long arg2, unsigned long arg3,
+			 unsigned long arg4);
 
 void sbi_console_putchar(int ch);
 int sbi_console_getchar(void);

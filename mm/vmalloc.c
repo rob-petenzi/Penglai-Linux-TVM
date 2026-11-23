@@ -42,6 +42,8 @@
 #include <linux/sched/mm.h>
 #include <asm/tlbflush.h>
 #include <asm/shmparam.h>
+#include <asm/sbi.h>
+#include <linux/pt_area.h>
 
 #include "internal.h"
 #include "pgalloc-track.h"
@@ -98,6 +100,15 @@ static void free_work(struct work_struct *w)
 }
 
 /*** Page table manipulation functions ***/
+#ifdef CONFIG_PT_AREA_BATCH
+#define PT_AREA_BATCH_SIZE 512
+static struct pt_area_batch_t pt_area_batch[PT_AREA_BATCH_SIZE + 1];
+static int pt_area_index;
+static DEFINE_SPINLOCK(pt_area_vunmap_lock);
+static struct pt_area_batch_t pt_area_set_batch[PT_AREA_BATCH_SIZE + 1];
+static int pt_area_set_index;
+static DEFINE_SPINLOCK(pt_area_vmap_lock);
+#endif
 static int vmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 			phys_addr_t phys_addr, pgprot_t prot,
 			unsigned int max_page_shift, pgtbl_mod_mask *mask)
@@ -332,10 +343,52 @@ static void vunmap_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 	pte_t *pte;
 
 	pte = pte_offset_kernel(pmd, addr);
+	#ifdef CONFIG_PT_AREA_BATCH
+	spin_lock(&pt_area_vunmap_lock);
+	#endif
 	do {
-		pte_t ptent = ptep_get_and_clear(&init_mm, addr, pte);
+		pte_t ptent;
+		#ifdef CONFIG_PT_AREA_BATCH
+		if(enclave_module_installed)
+		{
+			// if ptep is not contiguous with the last ptep, allocate a new struct of pt_area_batch
+			if (unlikely(pt_area_index == PT_AREA_BATCH_SIZE))
+			{
+				SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_BATCH_ZERO, __pa(&(pt_area_batch[1])), pt_area_index, 0);
+				memset(pt_area_batch, 0 , (pt_area_index+1) * sizeof(struct pt_area_batch_t));
+				pt_area_index = 0;
+			}
+			if (pt_area_batch[pt_area_index].ptep_base + pt_area_batch[pt_area_index].entity.ptep_size !=__pa(pte))
+			{
+				pt_area_index++;
+				pt_area_batch[pt_area_index].ptep_base = __pa(pte);
+				pt_area_batch[pt_area_index].entity.ptep_size = sizeof(pte_t);
+			}
+			else
+			{
+				pt_area_batch[pt_area_index].entity.ptep_size = pt_area_batch[pt_area_index].entity.ptep_size+sizeof(pte_t);
+			}
+			ptent = delay2_ptep_get_and_clear(&init_mm, addr, pte);
+		}
+		else
+			ptent = ptep_get_and_clear(&init_mm, addr, pte);
+		#else
+			ptent = ptep_get_and_clear(&init_mm, addr, pte);
+		#endif
 		WARN_ON(!pte_none(ptent) && !pte_present(ptent));
+		// printk("vmalloc/vunmap_pte_range\n");
 	} while (pte++, addr += PAGE_SIZE, addr != end);
+
+	#ifdef CONFIG_PT_AREA_BATCH
+	if(enclave_module_installed && pt_area_index)
+	{
+		SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_BATCH_ZERO, __pa(&(pt_area_batch[1])), pt_area_index, 0);
+		memset(pt_area_batch, 0 , (pt_area_index+1) * sizeof(struct pt_area_batch_t));
+		pt_area_index = 0;
+	}
+	spin_unlock(&pt_area_vunmap_lock);
+	#endif
+
 	*mask |= PGTBL_PTE_MODIFIED;
 }
 
@@ -477,19 +530,84 @@ static int vmap_pages_pte_range(pmd_t *pmd, unsigned long addr,
 	pte = pte_alloc_kernel_track(pmd, addr, mask);
 	if (!pte)
 		return -ENOMEM;
+	#ifdef CONFIG_PT_AREA_BATCH
+	spin_lock(&pt_area_vmap_lock);
+	#endif
 	do {
 		struct page *page = pages[*nr];
 
-		if (WARN_ON(!pte_none(*pte)))
+		if (WARN_ON(!pte_none(*pte))) {
+			#ifdef CONFIG_PT_AREA_BATCH
+			if (enclave_module_installed && pt_area_set_index) {
+				SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_BATCH_SET,
+						    __pa(&pt_area_set_batch[1]), pt_area_set_index, 0);
+				memset(pt_area_set_batch, 0,
+				       (pt_area_set_index + 1) * sizeof(struct pt_area_batch_t));
+				pt_area_set_index = 0;
+			}
+			spin_unlock(&pt_area_vmap_lock);
+			#endif
 			return -EBUSY;
-		if (WARN_ON(!page))
+		}
+		if (WARN_ON(!page)) {
+			#ifdef CONFIG_PT_AREA_BATCH
+			if (enclave_module_installed && pt_area_set_index) {
+				SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_BATCH_SET,
+						    __pa(&pt_area_set_batch[1]), pt_area_set_index, 0);
+				memset(pt_area_set_batch, 0,
+				       (pt_area_set_index + 1) * sizeof(struct pt_area_batch_t));
+				pt_area_set_index = 0;
+			}
+			spin_unlock(&pt_area_vmap_lock);
+			#endif
 			return -ENOMEM;
-		if (WARN_ON(!pfn_valid(page_to_pfn(page))))
+		}
+		if (WARN_ON(!pfn_valid(page_to_pfn(page)))) {
+			#ifdef CONFIG_PT_AREA_BATCH
+			if (enclave_module_installed && pt_area_set_index) {
+				SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_BATCH_SET,
+						    __pa(&pt_area_set_batch[1]), pt_area_set_index, 0);
+				memset(pt_area_set_batch, 0,
+				       (pt_area_set_index + 1) * sizeof(struct pt_area_batch_t));
+				pt_area_set_index = 0;
+			}
+			spin_unlock(&pt_area_vmap_lock);
+			#endif
 			return -EINVAL;
+		}
 
-		set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
+		#ifdef CONFIG_PT_AREA_BATCH
+		if (enclave_module_installed) {
+			if (unlikely(pt_area_set_index == PT_AREA_BATCH_SIZE)) {
+				SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE,
+						    SBI_SET_PTE_BATCH_SET,
+							__pa(&pt_area_set_batch[1]),
+						    pt_area_set_index, 0);
+				memset(pt_area_set_batch, 0,
+				       (pt_area_set_index + 1) *
+				       sizeof(struct pt_area_batch_t));
+				pt_area_set_index = 0;
+			}
+			pt_area_set_index++;
+			pt_area_set_batch[pt_area_set_index].ptep_base = __pa(pte);
+			pt_area_set_batch[pt_area_set_index].entity.ptep_entry =
+				mk_pte(page, prot).pte;
+			delay_set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
+		} else
+		#endif
+			set_pte_at(&init_mm, addr, pte, mk_pte(page, prot));
 		(*nr)++;
 	} while (pte++, addr += PAGE_SIZE, addr != end);
+	#ifdef CONFIG_PT_AREA_BATCH
+	if (enclave_module_installed && pt_area_set_index) {
+		SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_BATCH_SET,
+				    __pa(&pt_area_set_batch[1]), pt_area_set_index, 0);
+		memset(pt_area_set_batch, 0,
+		       (pt_area_set_index + 1) * sizeof(struct pt_area_batch_t));
+		pt_area_set_index = 0;
+	}
+	spin_unlock(&pt_area_vmap_lock);
+	#endif
 	*mask |= PGTBL_PTE_MODIFIED;
 	return 0;
 }

@@ -222,6 +222,7 @@ static void free_pte_range(struct mmu_gather *tlb, pmd_t *pmd,
 			   unsigned long addr)
 {
 	pgtable_t token = pmd_pgtable(*pmd);
+
 	pmd_clear(pmd);
 	pte_free_tlb(tlb, token, addr);
 	mm_dec_nr_ptes(tlb->mm);
@@ -930,6 +931,107 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 	return 0;
 }
 
+#ifdef CONFIG_PT_AREA_BATCH
+#define SBI_SM_SET_PTE 101
+#define SBI_SET_PTE_ONE 1
+#define SBI_PTE_MEMSET 2
+#define SBI_PTE_MEMCPY 3
+#define SBI_SET_PTE_BATCH_ZERO 4
+#define SBI_SET_PTE_BATCH_SET  5
+
+#define PT_AREA_BATCH_SIZE 512
+static struct pt_area_batch_t pt_area_set_batch2[NR_CPUS][PT_AREA_BATCH_SIZE + 1];
+static int pt_area_set_index2[NR_CPUS];
+static struct pt_area_batch_t pt_area_batch[NR_CPUS][PT_AREA_BATCH_SIZE + 1];
+static int pt_area_index[NR_CPUS];
+extern int enclave_module_installed;
+#include <asm/page.h>
+void flush_pt_area_set_buffer2(void)
+{
+	int cpu = smp_processor_id();
+	int idx = pt_area_set_index2[cpu];
+
+	if (!idx)
+		return;
+	SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_BATCH_SET, __pa(&(pt_area_set_batch2[cpu][1])), idx, 0);
+	memset(pt_area_set_batch2[cpu], 0, (idx + 1) * sizeof(struct pt_area_batch_t));
+	pt_area_set_index2[cpu] = 0;
+}
+/*
+ * Copy one pte.  Returns 0 if succeeded, or -EAGAIN if one preallocated page
+ * is required to copy this pte.
+ */
+static inline int
+copy_noset_present_pte(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma,
+		 pte_t *dst_pte, pte_t *src_pte, unsigned long addr, int *rss,
+		 struct page **prealloc)
+{
+	struct mm_struct *src_mm = src_vma->vm_mm;
+	unsigned long vm_flags = src_vma->vm_flags;
+	pte_t pte = *src_pte;
+	struct page *page;
+
+	page = vm_normal_page(src_vma, addr, pte);
+	if (page && PageAnon(page)) {
+		get_page(page);
+		if (unlikely(page_try_dup_anon_rmap(page, false, src_vma))) {
+			put_page(page);
+			return copy_present_page(dst_vma, src_vma, dst_pte,
+						 src_pte, addr, rss, prealloc,
+						 page);
+		}
+		rss[mm_counter(page)]++;
+	} else if (page) {
+		get_page(page);
+		page_dup_file_rmap(page, false);
+		rss[mm_counter(page)]++;
+	}
+
+	/*
+	 * If it's a COW mapping, write protect it both
+	 * in the parent and the child
+	 */
+	if (is_cow_mapping(vm_flags) && pte_write(pte)) {
+		ptep_set_wrprotect(src_mm, addr, src_pte);
+		pte = pte_wrprotect(pte);
+	}
+
+	/*
+	 * If it's a shared mapping, mark it clean in
+	 * the child
+	 */
+	if (vm_flags & VM_SHARED)
+		pte = pte_mkclean(pte);
+	pte = pte_mkold(pte);
+
+	/*
+	 * Make sure the _PAGE_UFFD_WP bit is cleared if the new VMA
+	 * does not have the VM_UFFD_WP, which means that the uffd
+	 * fork event is not enabled.
+	 */
+	if (!(vm_flags & VM_UFFD_WP))
+		pte = pte_clear_uffd_wp(pte);
+
+	if(enclave_module_installed)
+	{
+		int cpu = smp_processor_id();
+		int idx;
+
+		if (unlikely(pt_area_set_index2[cpu] == PT_AREA_BATCH_SIZE))
+			flush_pt_area_set_buffer2();
+
+		idx = ++pt_area_set_index2[cpu];
+		pt_area_set_batch2[cpu][idx].ptep_base = __pa(dst_pte);
+		pt_area_set_batch2[cpu][idx].entity.ptep_entry = pte.pte;
+		delay_set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);
+	}
+	else
+		set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);
+	// set_pte_at(dst_vma->vm_mm, addr, dst_pte, pte);
+	return 0;
+}
+
+#endif
 /*
  * Copy one pte.  Returns 0 if succeeded, or -EAGAIN if one preallocated page
  * is required to copy this pte.
@@ -1078,7 +1180,14 @@ again:
 			WARN_ON_ONCE(ret != -ENOENT);
 		}
 		/* copy_present_pte() will clear `*prealloc' if consumed */
-		ret = copy_present_pte(dst_vma, src_vma, dst_pte, src_pte,
+		#ifdef CONFIG_PT_AREA_BATCH
+		if (enclave_module_installed)
+			ret = copy_noset_present_pte(dst_vma, src_vma, dst_pte,
+						     src_pte, addr, rss,
+						     &prealloc);
+		else
+		#endif
+			ret = copy_present_pte(dst_vma, src_vma, dst_pte, src_pte,
 				       addr, rss, &prealloc);
 		/*
 		 * If we need a pre-allocated page for this pte, drop the
@@ -1098,6 +1207,11 @@ again:
 		}
 		progress += 8;
 	} while (dst_pte++, src_pte++, addr += PAGE_SIZE, addr != end);
+
+	#ifdef CONFIG_PT_AREA_BATCH
+	if(enclave_module_installed)
+		flush_pt_area_set_buffer2();
+	#endif
 
 	arch_leave_lazy_mmu_mode();
 	spin_unlock(src_ptl);
@@ -1422,6 +1536,37 @@ again:
 			page = vm_normal_page(vma, addr, ptent);
 			if (unlikely(!should_zap_page(details, page)))
 				continue;
+			#ifdef CONFIG_PT_AREA_BATCH
+			if (enclave_module_installed) {
+				int cpu = smp_processor_id();
+				int idx = pt_area_index[cpu];
+
+				if (unlikely(idx == PT_AREA_BATCH_SIZE)) {
+					SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE,
+							    SBI_SET_PTE_BATCH_ZERO,
+							    __pa(&pt_area_batch[cpu][1]),
+							    idx, 0);
+					memset(pt_area_batch[cpu], 0,
+					       (idx + 1) *
+					       sizeof(struct pt_area_batch_t));
+					idx = 0;
+					pt_area_index[cpu] = 0;
+				}
+				if (pt_area_batch[cpu][idx].ptep_base +
+				    pt_area_batch[cpu][idx].entity.ptep_size !=
+				    __pa(pte)) {
+					idx = ++pt_area_index[cpu];
+					pt_area_batch[cpu][idx].ptep_base = __pa(pte);
+					pt_area_batch[cpu][idx].entity.ptep_size =
+						sizeof(pte_t);
+				} else {
+					pt_area_batch[cpu][idx].entity.ptep_size +=
+						sizeof(pte_t);
+				}
+				ptent = delay_ptep_get_and_clear_full(mm, addr, pte,
+							      tlb->fullmm);
+			} else
+			#endif
 			ptent = ptep_get_and_clear_full(mm, addr, pte,
 							tlb->fullmm);
 			tlb_remove_tlb_entry(tlb, pte, addr);
@@ -1495,6 +1640,21 @@ again:
 		pte_clear_not_present_full(mm, addr, pte, tlb->fullmm);
 		zap_install_uffd_wp_if_needed(vma, addr, pte, details, ptent);
 	} while (pte++, addr += PAGE_SIZE, addr != end);
+	#ifdef CONFIG_PT_AREA_BATCH
+	if (enclave_module_installed) {
+		int cpu = smp_processor_id();
+		int idx = pt_area_index[cpu];
+
+		if (idx) {
+			SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE,
+					    SBI_SET_PTE_BATCH_ZERO,
+					    __pa(&pt_area_batch[cpu][1]), idx, 0);
+			memset(pt_area_batch[cpu], 0,
+			       (idx + 1) * sizeof(struct pt_area_batch_t));
+			pt_area_index[cpu] = 0;
+		}
+	}
+	#endif
 
 	add_mm_rss_vec(mm, rss);
 	arch_leave_lazy_mmu_mode();
@@ -4357,6 +4517,52 @@ void do_set_pte(struct vm_fault *vmf, struct page *page, unsigned long addr)
 	}
 	set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
 }
+
+#ifdef CONFIG_PT_AREA_BATCH
+/** Set up a faulted PTE and defer its protected write for batch submission. */
+void do_set_pte_noset(struct vm_fault *vmf, struct page *page,
+		      unsigned long addr)
+{
+	struct vm_area_struct *vma = vmf->vma;
+	bool uffd_wp = pte_marker_uffd_wp(vmf->orig_pte);
+	bool write = vmf->flags & FAULT_FLAG_WRITE;
+	bool prefault = vmf->address != addr;
+	pte_t entry;
+
+	flush_icache_page(vma, page);
+	entry = mk_pte(page, vma->vm_page_prot);
+	if (prefault && arch_wants_old_prefaulted_pte())
+		entry = pte_mkold(entry);
+	else
+		entry = pte_sw_mkyoung(entry);
+	if (write)
+		entry = maybe_mkwrite(pte_mkdirty(entry), vma);
+	if (unlikely(uffd_wp))
+		entry = pte_mkuffd_wp(pte_wrprotect(entry));
+	if (write && !(vma->vm_flags & VM_SHARED)) {
+		inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+		page_add_new_anon_rmap(page, vma, addr);
+		lru_cache_add_inactive_or_unevictable(page, vma);
+	} else {
+		inc_mm_counter_fast(vma->vm_mm, mm_counter_file(page));
+		page_add_file_rmap(page, vma, false);
+	}
+
+	if (enclave_module_installed) {
+		int cpu = smp_processor_id();
+		int idx;
+
+		if (unlikely(pt_area_set_index2[cpu] == PT_AREA_BATCH_SIZE))
+			flush_pt_area_set_buffer2();
+		idx = ++pt_area_set_index2[cpu];
+		pt_area_set_batch2[cpu][idx].ptep_base = __pa(vmf->pte);
+		pt_area_set_batch2[cpu][idx].entity.ptep_entry = entry.pte;
+		delay_set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
+	} else {
+		set_pte_at(vma->vm_mm, addr, vmf->pte, entry);
+	}
+}
+#endif
 
 static bool vmf_pte_changed(struct vm_fault *vmf)
 {

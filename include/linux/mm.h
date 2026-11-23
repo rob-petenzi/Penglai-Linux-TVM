@@ -1023,6 +1023,11 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
 
 vm_fault_t do_set_pmd(struct vm_fault *vmf, struct page *page);
 void do_set_pte(struct vm_fault *vmf, struct page *page, unsigned long addr);
+#ifdef CONFIG_PT_AREA_BATCH
+void do_set_pte_noset(struct vm_fault *vmf, struct page *page,
+		      unsigned long addr);
+void flush_pt_area_set_buffer2(void);
+#endif
 
 vm_fault_t finish_fault(struct vm_fault *vmf);
 vm_fault_t finish_mkwrite_fault(struct vm_fault *vmf);

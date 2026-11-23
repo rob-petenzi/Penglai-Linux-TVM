@@ -9,6 +9,10 @@
 
 #include <linux/mm.h>
 #include <asm/tlb.h>
+#ifdef CONFIG_PT_AREA
+#include <linux/pt_area.h>
+#include <asm/sbi.h>
+#endif
 
 #ifdef CONFIG_MMU
 #define __HAVE_ARCH_PUD_ALLOC_ONE
@@ -83,7 +87,8 @@ static inline void pgd_populate_safe(struct mm_struct *mm, pgd_t *pgd,
 static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long addr)
 {
 	if (pgtable_l4_enabled)
-		return __pud_alloc_one(mm, addr);
+		return (pud_t *)get_zeroed_page(mm == &init_mm ?
+						GFP_PGTABLE_KERNEL : GFP_PGTABLE_USER);
 
 	return NULL;
 }
@@ -92,7 +97,7 @@ static inline pud_t *pud_alloc_one(struct mm_struct *mm, unsigned long addr)
 static inline void pud_free(struct mm_struct *mm, pud_t *pud)
 {
 	if (pgtable_l4_enabled)
-		__pud_free(mm, pud);
+		free_page((unsigned long)pud);
 }
 
 #define __pud_free_tlb(tlb, pud, addr)  pud_free((tlb)->mm, pud)
@@ -138,6 +143,25 @@ static inline pgd_t *pgd_alloc(struct mm_struct *mm)
 {
 	pgd_t *pgd;
 
+#ifdef CONFIG_PT_AREA
+	pgd = (pgd_t *)alloc_pt_pgd_page();
+	if (likely(pgd != NULL)) {
+		if (enclave_module_installed) {
+			SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_PTE_MEMSET,
+					    __pa(pgd), 0,
+					    USER_PTRS_PER_PGD * sizeof(pgd_t));
+			SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_PTE_MEMCPY,
+					    __pa(pgd + USER_PTRS_PER_PGD),
+					    __pa(init_mm.pgd + USER_PTRS_PER_PGD),
+					    (PTRS_PER_PGD - USER_PTRS_PER_PGD) *
+				    sizeof(pgd_t));
+		} else {
+			memset(pgd, 0, USER_PTRS_PER_PGD * sizeof(pgd_t));
+			sync_kernel_mappings(pgd);
+		}
+	}
+	return pgd;
+#else
 	pgd = (pgd_t *)__get_free_page(GFP_KERNEL);
 	if (likely(pgd != NULL)) {
 		memset(pgd, 0, USER_PTRS_PER_PGD * sizeof(pgd_t));
@@ -145,8 +169,8 @@ static inline pgd_t *pgd_alloc(struct mm_struct *mm)
 		sync_kernel_mappings(pgd);
 	}
 	return pgd;
+#endif
 }
-
 #ifndef __PAGETABLE_PMD_FOLDED
 
 #define __pmd_free_tlb(tlb, pmd, addr)  pmd_free((tlb)->mm, pmd)

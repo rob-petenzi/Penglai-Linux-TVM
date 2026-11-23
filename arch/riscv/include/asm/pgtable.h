@@ -109,8 +109,10 @@
 #ifndef __ASSEMBLY__
 
 #include <asm/page.h>
+#include <asm/sbi.h>
 #include <asm/tlbflush.h>
 #include <linux/mm_types.h>
+#include <linux/pt_area.h>
 
 #define __page_val_to_pfn(_val)  (((_val) & _PAGE_PFN_MASK) >> _PAGE_PFN_SHIFT)
 
@@ -189,6 +191,10 @@ extern struct pt_alloc_ops pt_ops __initdata;
 #define PAGE_KERNEL_IO		__pgprot(_PAGE_IOREMAP)
 
 extern pgd_t swapper_pg_dir[];
+#ifdef CONFIG_PT_AREA
+extern int enclave_module_installed;
+extern pgd_t *new_swapper_pg_dir;
+#endif
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 static inline int pmd_present(pmd_t pmd)
@@ -226,7 +232,16 @@ static inline int pmd_leaf(pmd_t pmd)
 
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
+	#ifdef CONFIG_PT_AREA
+	if(enclave_module_installed)
+	{
+		SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_ONE, __pa(pmdp), pmd.pmd, 0);
+	}
+	else
+		*pmdp=pmd;
+	#else
 	*pmdp = pmd;
+	#endif /*CONFIG_PT_AREA*/
 }
 
 static inline void pmd_clear(pmd_t *pmdp)
@@ -436,6 +451,7 @@ static inline int pte_same(pte_t pte_a, pte_t pte_b)
 	return pte_val(pte_a) == pte_val(pte_b);
 }
 
+
 /*
  * Certain architectures need to do special things when PTEs within
  * a page table are directly modified.  Thus, the following hook is
@@ -443,7 +459,19 @@ static inline int pte_same(pte_t pte_a, pte_t pte_b)
  */
 static inline void set_pte(pte_t *ptep, pte_t pteval)
 {
-	*ptep = pteval;
+	#ifdef CONFIG_PT_AREA
+
+	if(enclave_module_installed)
+	{
+		// printk("set_pte\n");
+		// dump_stack();
+		SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_ONE, __pa(ptep), pteval.pte, 0);
+	}
+	else
+		*ptep = pteval;
+	#else
+		*ptep = pteval;
+	#endif /*CONFIG_PT_AREA*/
 }
 
 void flush_icache_pte(pte_t pte);
@@ -464,11 +492,27 @@ static inline void set_pte_at(struct mm_struct *mm,
 	__set_pte_at(mm, addr, ptep, pteval);
 }
 
+#ifdef CONFIG_PT_AREA_BATCH
+static inline void delay_set_pte_at(struct mm_struct *mm,
+	unsigned long addr, pte_t *ptep, pte_t pteval)
+{
+	if (pte_present(pteval) && pte_exec(pteval))
+		flush_icache_pte(pteval);
+}
+#endif
+
 static inline void pte_clear(struct mm_struct *mm,
 	unsigned long addr, pte_t *ptep)
 {
 	__set_pte_at(mm, addr, ptep, __pte(0));
 }
+
+#ifdef CONFIG_PT_AREA_BATCH
+static inline void delay_pte_clear(struct mm_struct *mm,
+	unsigned long addr, pte_t *ptep)
+{
+}
+#endif
 
 #define __HAVE_ARCH_PTEP_SET_ACCESS_FLAGS
 static inline int ptep_set_access_flags(struct vm_area_struct *vma,
@@ -488,7 +532,17 @@ static inline int ptep_set_access_flags(struct vm_area_struct *vma,
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
 				       unsigned long address, pte_t *ptep)
 {
-	pte_t pte = __pte(atomic_long_xchg((atomic_long_t *)ptep, 0));
+	pte_t pte;
+
+#ifdef CONFIG_PT_AREA
+	if (enclave_module_installed) {
+		pte = *ptep;
+		pte_clear(mm, address, ptep);
+		page_table_check_pte_clear(mm, address, pte);
+		return pte;
+	}
+#endif
+	pte = __pte(atomic_long_xchg((atomic_long_t *)ptep, 0));
 
 	page_table_check_pte_clear(mm, address, pte);
 
@@ -509,7 +563,22 @@ static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
 static inline void ptep_set_wrprotect(struct mm_struct *mm,
 				      unsigned long address, pte_t *ptep)
 {
-	atomic_long_and(~(unsigned long)_PAGE_WRITE, (atomic_long_t *)ptep);
+	#ifdef CONFIG_PT_AREA
+	if(enclave_module_installed)
+	{
+		pte_t pteval;
+		pteval.pte = (~(unsigned long)_PAGE_WRITE) & (ptep->pte);
+		// printk("ptep_set_wrprotect\n");
+		// dump_stack();
+		SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_ONE, __pa(ptep), pteval.pte, 0);
+	}
+	else
+	{
+		atomic_long_and(~(unsigned long)_PAGE_WRITE, (atomic_long_t *)ptep);
+	}
+	#else
+		atomic_long_and(~(unsigned long)_PAGE_WRITE, (atomic_long_t *)ptep);
+	#endif
 }
 
 #define __HAVE_ARCH_PTEP_CLEAR_YOUNG_FLUSH

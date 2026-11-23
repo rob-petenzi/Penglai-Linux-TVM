@@ -113,6 +113,14 @@ static inline pmd_t *pmd_offset(pud_t *pud, unsigned long address)
 #define pmd_offset pmd_offset
 #endif
 
+#ifndef pte_offset
+static inline pte_t *pte_offset(pmd_t *pmd, unsigned long address)
+{
+	return (pte_t *)pmd_page_vaddr(*pmd) + pte_index(address);
+}
+#define pte_offset pte_offset
+#endif
+
 #ifndef pud_offset
 static inline pud_t *pud_offset(p4d_t *p4d, unsigned long address)
 {
@@ -291,6 +299,16 @@ static inline bool arch_has_hw_pte_young(void)
 }
 #endif
 
+#ifdef CONFIG_PT_AREA_BATCH
+struct pt_area_batch_t {
+	unsigned long ptep_base;
+	union {
+		unsigned long ptep_size;
+		unsigned long ptep_entry;
+	} entity;
+};
+#endif
+
 #ifndef __HAVE_ARCH_PTEP_GET_AND_CLEAR
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
 				       unsigned long address,
@@ -299,6 +317,17 @@ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
 	pte_t pte = *ptep;
 	pte_clear(mm, address, ptep);
 	page_table_check_pte_clear(mm, address, pte);
+	return pte;
+}
+#endif
+
+#ifdef CONFIG_PT_AREA_BATCH
+static inline pte_t delay2_ptep_get_and_clear(struct mm_struct *mm,
+					       unsigned long address,
+					       pte_t *ptep)
+{
+	pte_t pte = *ptep;
+	delay_pte_clear(mm, address, ptep);
 	return pte;
 }
 #endif
@@ -429,6 +458,18 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
 	pte = ptep_get_and_clear(mm, address, ptep);
 	return pte;
 }
+
+#ifdef CONFIG_PT_AREA_BATCH
+static inline pte_t delay_ptep_get_and_clear_full(struct mm_struct *mm,
+					    unsigned long address, pte_t *ptep,
+					    int full)
+{
+	pte_t pte;
+	pte = delay2_ptep_get_and_clear(mm, address, ptep);
+	return pte;
+}
+#endif
+
 #endif
 
 
