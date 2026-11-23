@@ -258,19 +258,24 @@ static irqreturn_t netup_unidvb_isr(int irq, void *dev_id)
 	if ((reg40 & AVL_IRQ_ASSERTED) != 0) {
 		/* IRQ is being signaled */
 		reg_isr = readw(ndev->bmmio0 + REG_ISR);
-		if (reg_isr & NETUP_UNIDVB_IRQ_I2C0) {
-			iret = netup_i2c_interrupt(&ndev->i2c[0]);
-		} else if (reg_isr & NETUP_UNIDVB_IRQ_I2C1) {
-			iret = netup_i2c_interrupt(&ndev->i2c[1]);
-		} else if (reg_isr & NETUP_UNIDVB_IRQ_SPI) {
+		if (reg_isr & NETUP_UNIDVB_IRQ_SPI)
 			iret = netup_spi_interrupt(ndev->spi);
-		} else if (reg_isr & NETUP_UNIDVB_IRQ_DMA1) {
-			iret = netup_dma_interrupt(&ndev->dma[0]);
-		} else if (reg_isr & NETUP_UNIDVB_IRQ_DMA2) {
-			iret = netup_dma_interrupt(&ndev->dma[1]);
-		} else if (reg_isr & NETUP_UNIDVB_IRQ_CI) {
-			iret = netup_ci_interrupt(ndev);
+		else if (!ndev->old_fw) {
+			if (reg_isr & NETUP_UNIDVB_IRQ_I2C0) {
+				iret = netup_i2c_interrupt(&ndev->i2c[0]);
+			} else if (reg_isr & NETUP_UNIDVB_IRQ_I2C1) {
+				iret = netup_i2c_interrupt(&ndev->i2c[1]);
+			} else if (reg_isr & NETUP_UNIDVB_IRQ_DMA1) {
+				iret = netup_dma_interrupt(&ndev->dma[0]);
+			} else if (reg_isr & NETUP_UNIDVB_IRQ_DMA2) {
+				iret = netup_dma_interrupt(&ndev->dma[1]);
+			} else if (reg_isr & NETUP_UNIDVB_IRQ_CI) {
+				iret = netup_ci_interrupt(ndev);
+			} else {
+				goto err;
+			}
 		} else {
+err:
 			dev_err(&pci_dev->dev,
 				"%s(): unknown interrupt 0x%x\n",
 				__func__, reg_isr);
@@ -692,7 +697,7 @@ static void netup_unidvb_dma_fini(struct netup_unidvb_dev *ndev, int num)
 	netup_unidvb_dma_enable(dma, 0);
 	msleep(50);
 	cancel_work_sync(&dma->work);
-	del_timer(&dma->timeout);
+	del_timer_sync(&dma->timeout);
 }
 
 static int netup_unidvb_dma_setup(struct netup_unidvb_dev *ndev)
@@ -841,7 +846,7 @@ static int netup_unidvb_initdev(struct pci_dev *pci_dev,
 		"%s(): board vendor 0x%x, revision 0x%x\n",
 		__func__, board_vendor, board_revision);
 	pci_set_master(pci_dev);
-	if (pci_set_dma_mask(pci_dev, 0xffffffff) < 0) {
+	if (dma_set_mask(&pci_dev->dev, 0xffffffff) < 0) {
 		dev_err(&pci_dev->dev,
 			"%s(): 32bit PCI DMA is not supported\n", __func__);
 		goto pci_detect_err;
