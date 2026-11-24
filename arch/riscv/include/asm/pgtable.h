@@ -556,6 +556,15 @@ static inline int ptep_test_and_clear_young(struct vm_area_struct *vma,
 {
 	if (!pte_young(*ptep))
 		return 0;
+#ifdef CONFIG_PT_AREA
+	if (enclave_module_installed) {
+		pte_t pteval = __pte(pte_val(*ptep) & ~_PAGE_ACCESSED);
+
+		SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_ONE,
+				    __pa(ptep), pteval.pte, 0);
+		return 1;
+	}
+#endif
 	return test_and_clear_bit(_PAGE_ACCESSED_OFFSET, &pte_val(*ptep));
 }
 

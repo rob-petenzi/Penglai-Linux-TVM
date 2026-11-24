@@ -164,7 +164,15 @@ static inline int pud_user(pud_t pud)
 
 static inline void set_pud(pud_t *pudp, pud_t pud)
 {
+#ifdef CONFIG_PT_AREA
+	if (enclave_module_installed)
+		SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_ONE,
+				    __pa(pudp), pud_val(pud), 0);
+	else
+		*pudp = pud;
+#else
 	*pudp = pud;
+#endif
 }
 
 static inline void pud_clear(pud_t *pudp)
@@ -239,10 +247,19 @@ static inline unsigned long _pmd_pfn(pmd_t pmd)
 
 static inline void set_p4d(p4d_t *p4dp, p4d_t p4d)
 {
-	if (pgtable_l4_enabled)
+	if (pgtable_l4_enabled) {
+#ifdef CONFIG_PT_AREA
+		if (enclave_module_installed)
+			SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_ONE,
+					    __pa(p4dp), p4d_val(p4d), 0);
+		else
+			*p4dp = p4d;
+#else
 		*p4dp = p4d;
-	else
+#endif
+	} else {
 		set_pud((pud_t *)p4dp, (pud_t){ p4d_val(p4d) });
+	}
 }
 
 static inline int p4d_none(p4d_t p4d)
@@ -312,10 +329,19 @@ static inline pud_t *pud_offset(p4d_t *p4d, unsigned long address)
 
 static inline void set_pgd(pgd_t *pgdp, pgd_t pgd)
 {
-	if (pgtable_l5_enabled)
+	if (pgtable_l5_enabled) {
+#ifdef CONFIG_PT_AREA
+		if (enclave_module_installed)
+			SBI_PENGLAI_ECALL_4(SBI_SM_SET_PTE, SBI_SET_PTE_ONE,
+					    __pa(pgdp), pgd_val(pgd), 0);
+		else
+			*pgdp = pgd;
+#else
 		*pgdp = pgd;
-	else
+#endif
+	} else {
 		set_p4d((p4d_t *)pgdp, (p4d_t){ pgd_val(pgd) });
+	}
 }
 
 static inline int pgd_none(pgd_t pgd)
